@@ -1,0 +1,383 @@
+# Alga PSA Community Edition for Coolify (Docker Compose build pack).
+#
+# Differences from docker-compose.prebuilt.ce.yaml, which expects a local
+# ./secrets directory and `extends` across files:
+#   - Secrets come from Coolify-generated SERVICE_PASSWORD_64_* values. The
+#     one-shot `secrets-init` service writes them into one volume per consumer
+#     (files 0400, owned by the reading uid), mounted at /run/secrets, so each
+#     container sees only its own secrets. Entrypoints are unchanged. Never also
+#     set a secret (e.g. NEXTAUTH_SECRET) as an env var: the env provider is read
+#     first and would silently override the file.
+#   - Migrations, seeds and scripts come from the server image itself (baked by
+#     the root Dockerfile) instead of bind mounts, so schema and code always match.
+#   - Pin ALGA_IMAGE_TAG to the commit this file is deployed from; Redis,
+#     PgBouncer and the workflow worker are built from that same checkout
+#     (their Dockerfiles still use floating redis/pgbouncer base images).
+#
+# Coolify settings this file relies on (see docs/deployment/coolify.md):
+#   - Configuration > General > "Preserve Repository During Deployment" ON
+#     (setup and postgres bind-mount scripts from the repository).
+#   - Domain for the `server` service, e.g. https://psa.xogent.com:3000
+
+services:
+  secrets-init:
+    image: busybox:1.37
+    restart: "no"
+    exclude_from_hc: true
+    environment:
+      S_POSTGRES_PASSWORD: ${SERVICE_PASSWORD_64_ALGAPOSTGRES}
+      S_DB_PASSWORD_SERVER: ${SERVICE_PASSWORD_64_ALGAAPPUSER}
+      S_DB_PASSWORD_HOCUSPOCUS: ${SERVICE_PASSWORD_64_ALGAHOCUSPOCUS}
+      S_REDIS_PASSWORD: ${SERVICE_PASSWORD_64_ALGAREDIS}
+      S_CRYPTO_KEY: ${SERVICE_PASSWORD_64_ALGACRYPTO}
+      S_TOKEN_SECRET_KEY: ${SERVICE_PASSWORD_64_ALGATOKEN}
+      S_NEXTAUTH_SECRET: ${SERVICE_PASSWORD_64_ALGANEXTAUTH}
+      S_CREDENTIAL_ENCRYPTION_KEY: ${SERVICE_PASSWORD_64_ALGACREDENTIAL}
+      S_ALGA_AUTH_KEY: ${SERVICE_PASSWORD_64_ALGAAUTH}
+      # Optional, operator-supplied; files are only written when non-empty.
+      S_EMAIL_PASSWORD: ${EMAIL_PASSWORD:-}
+      S_GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      S_GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+    # One volume per consumer so each container sees only the secrets it needs.
+    volumes:
+      - secrets_postgres:/out/postgres
+      - secrets_temporal:/out/temporal
+      - secrets_pgbouncer:/out/pgbouncer
+      - secrets_redis:/out/redis
+      - secrets_setup:/out/setup
+      - secrets_server:/out/server
+      - secrets_worker:/out/worker
+      - tenant_secrets:/out/tenants
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        umask 077
+        for v in S_POSTGRES_PASSWORD S_DB_PASSWORD_SERVER S_DB_PASSWORD_HOCUSPOCUS S_REDIS_PASSWORD \
+                 S_CRYPTO_KEY S_TOKEN_SECRET_KEY S_NEXTAUTH_SECRET S_CREDENTIAL_ENCRYPTION_KEY S_ALGA_AUTH_KEY; do
+          eval "val=\$${$$v:-}"
+          [ -n "$$val" ] || { echo "secrets-init: required value $$v is empty" >&2; exit 1; }
+        done
+        # put <volume> <uid> <file> <value>: atomic write, mode 0400, owned by the reading uid.
+        # Empty values (optional secrets) remove any stale file instead.
+        put() {
+          if [ -n "$$4" ]; then
+            printf '%s' "$$4" > "/out/$$1/.$$3.tmp"
+            chown "$$2" "/out/$$1/.$$3.tmp"
+            chmod 0400 "/out/$$1/.$$3.tmp"
+            mv "/out/$$1/.$$3.tmp" "/out/$$1/$$3"
+          else
+            rm -f "/out/$$1/$$3"
+          fi
+        }
+        # postgres image reads POSTGRES_PASSWORD_FILE as uid 999; temporal runs as uid 1000.
+        put postgres 999 postgres_password "$$S_POSTGRES_PASSWORD"
+        put temporal 1000 postgres_password "$$S_POSTGRES_PASSWORD"
+        put pgbouncer 0 postgres_password "$$S_POSTGRES_PASSWORD"
+        put pgbouncer 0 db_password_server "$$S_DB_PASSWORD_SERVER"
+        put redis 0 redis_password "$$S_REDIS_PASSWORD"
+        put setup 0 postgres_password "$$S_POSTGRES_PASSWORD"
+        put setup 0 db_password_server "$$S_DB_PASSWORD_SERVER"
+        put setup 0 db_password_hocuspocus "$$S_DB_PASSWORD_HOCUSPOCUS"
+        for f in postgres_password:S_POSTGRES_PASSWORD db_password_server:S_DB_PASSWORD_SERVER \
+                 db_password_hocuspocus:S_DB_PASSWORD_HOCUSPOCUS redis_password:S_REDIS_PASSWORD \
+                 crypto_key:S_CRYPTO_KEY token_secret_key:S_TOKEN_SECRET_KEY nextauth_secret:S_NEXTAUTH_SECRET \
+                 credential_encryption_key:S_CREDENTIAL_ENCRYPTION_KEY alga_auth_key:S_ALGA_AUTH_KEY \
+                 email_password:S_EMAIL_PASSWORD google_oauth_client_id:S_GOOGLE_OAUTH_CLIENT_ID \
+                 google_oauth_client_secret:S_GOOGLE_OAUTH_CLIENT_SECRET; do
+          eval "val=\$${$${f#*:}:-}"
+          put server 0 "$${f%%:*}" "$$val"
+        done
+        for f in postgres_password:S_POSTGRES_PASSWORD db_password_server:S_DB_PASSWORD_SERVER \
+                 redis_password:S_REDIS_PASSWORD crypto_key:S_CRYPTO_KEY token_secret_key:S_TOKEN_SECRET_KEY \
+                 nextauth_secret:S_NEXTAUTH_SECRET; do
+          eval "val=\$${$${f#*:}:-}"
+          put worker 0 "$${f%%:*}" "$$val"
+        done
+        # Mount points for the shared tenant_secrets volume.
+        mkdir -p /out/server/tenants /out/worker/tenants
+        # Volume roots must be 0700 and owned by the reading uid: the server's filesystem
+        # secret store refuses (and cannot chmod, being read-only) any other root mode.
+        chown 999 /out/postgres; chown 1000 /out/temporal
+        chmod 0700 /out/postgres /out/temporal /out/pgbouncer /out/redis /out/setup \
+                   /out/server /out/worker /out/tenants
+        echo "secrets-init: secrets written"
+
+  postgres:
+    image: ${ALGA_PGVECTOR_IMAGE:-pgvector/pgvector:0.8.7-pg15-bookworm@sha256:47af0b65960b14f1c6945aa4ccae37836c632e9a6fe0eea9160936e616e5b2e9}
+    restart: unless-stopped
+    # Wrapper refuses/repairs legacy `trust` entries in pg_hba.conf, then execs the stock entrypoint.
+    entrypoint: ["/bin/bash", "/usr/local/bin/alga-postgres-entrypoint.sh"]
+    command: postgres -c password_encryption=md5
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: server
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: "--auth-host=md5 --auth-local=md5"
+      POSTGRES_HOST_AUTH_METHOD: md5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - secrets_postgres:/run/secrets:ro
+      - type: bind
+        source: ./postgres/alga-postgres-entrypoint.sh
+        target: /usr/local/bin/alga-postgres-entrypoint.sh
+        read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d server"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+
+  # One-shot: brings extensions of an existing data directory in line with the pinned image.
+  postgres-extension-update:
+    image: ${ALGA_PGVECTOR_IMAGE:-pgvector/pgvector:0.8.7-pg15-bookworm@sha256:47af0b65960b14f1c6945aa4ccae37836c632e9a6fe0eea9160936e616e5b2e9}
+    restart: "no"
+    exclude_from_hc: true
+    entrypoint: ["/bin/sh", "/opt/alga/update-extensions.sh"]
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - secrets_postgres:/run/secrets:ro
+      - type: bind
+        source: ./helm/files/postgres/update-extensions.sh
+        target: /opt/alga/update-extensions.sh
+        read_only: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  pgbouncer:
+    build:
+      context: ./pgbouncer
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_HOST: postgres
+      DB_USER_SERVER: app_user
+    volumes:
+      - secrets_pgbouncer:/run/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis:
+    build:
+      context: .
+      dockerfile: redis/Dockerfile
+    restart: unless-stopped
+    volumes:
+      - secrets_redis:/run/secrets:ro
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+
+  # One-shot: creates roles/databases, runs migrations and seeds from the server image.
+  setup:
+    image: "ghcr.io/nine-minds/alga-psa-ce:${ALGA_IMAGE_TAG:-43b1f2ec}"
+    platform: linux/amd64
+    restart: "no"
+    exclude_from_hc: true
+    entrypoint: ["/app/setup/entrypoint.sh"]
+    environment:
+      EDITION: community
+      NODE_OPTIONS: --experimental-vm-modules
+      APP_NAME: ${APP_NAME:-alga-psa}
+      VERSION: ${VERSION:-1.0.0}
+      APP_ENV: production
+      NODE_ENV: production
+      HOST: ${ALGA_PUBLIC_URL:-https://psa.xogent.com}
+      DB_TYPE: postgres
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_HOST_ADMIN: postgres
+      DB_PORT_ADMIN: "5432"
+      DB_NAME_SERVER: server
+      DB_USER_SERVER: app_user
+      DB_USER_ADMIN: postgres
+      DB_NAME_HOCUSPOCUS: hocuspocus
+      DB_USER_HOCUSPOCUS: hocuspocus_user
+      PGBOSS_DATABASE: server
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NEXTAUTH_URL: ${ALGA_PUBLIC_URL:-https://psa.xogent.com}
+      NEXTAUTH_SESSION_EXPIRES: ${NEXTAUTH_SESSION_EXPIRES:-86400}
+    volumes:
+      - secrets_setup:/run/secrets:ro
+      - type: bind
+        source: ./setup/config.ini
+        target: /app/setup/config.ini
+        read_only: true
+      - type: bind
+        source: ./setup/entrypoint.sh
+        target: /app/setup/entrypoint.sh
+        read_only: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-extension-update:
+        condition: service_completed_successfully
+
+  server:
+    image: "ghcr.io/nine-minds/alga-psa-ce:${ALGA_IMAGE_TAG:-43b1f2ec}"
+    platform: linux/amd64
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c", "export DATABASE_URL=postgresql://app_user:$$(cat /run/secrets/db_password_server)@pgbouncer:6432/server && exec /app/entrypoint.sh"]
+    expose:
+      - "3000"
+    environment:
+      EDITION: community
+      APP_NAME: ${APP_NAME:-alga-psa}
+      VERSION: ${VERSION:-1.0.0}
+      APP_ENV: production
+      NODE_ENV: production
+      APP_PORT: "3000"
+      PORT: "3000"
+      # Docker sets HOSTNAME to the container id; make Next.js listen on all interfaces.
+      HOSTNAME: 0.0.0.0
+      HOST: ${ALGA_PUBLIC_URL:-https://psa.xogent.com}
+      APPLICATION_URL: ${ALGA_PUBLIC_URL:-https://psa.xogent.com}
+      NEXT_PUBLIC_BASE_URL: ${ALGA_PUBLIC_URL:-https://psa.xogent.com}
+      NEXTAUTH_URL: ${ALGA_PUBLIC_URL:-https://psa.xogent.com}
+      NEXTAUTH_SESSION_EXPIRES: ${NEXTAUTH_SESSION_EXPIRES:-86400}
+      # Traefik terminates TLS and forwards Host / X-Forwarded-* headers.
+      AUTH_TRUST_HOST: "true"
+      TRUST_FORWARDED_HOST: "true"
+      VERIFY_EMAIL_ENABLED: ${VERIFY_EMAIL_ENABLED:-false}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DB_TYPE: postgres
+      DB_HOST: pgbouncer
+      DB_PORT: "6432"
+      DB_NAME: server
+      DB_NAME_SERVER: server
+      DB_USER_SERVER: app_user
+      DB_USER_ADMIN: postgres
+      DB_NAME_HOCUSPOCUS: hocuspocus
+      DB_USER_HOCUSPOCUS: hocuspocus_user
+      PGBOSS_DATABASE: server
+      REQUIRE_HOCUSPOCUS: "false"
+      TEMPORAL_ADDRESS: temporal:7233
+      CRYPTO_SALT_BYTES: "16"
+      CRYPTO_ITERATION: "100000"
+      CRYPTO_KEY_LENGTH: "64"
+      CRYPTO_ALGORITHM: aes-256-gcm
+      TOKEN_EXPIRES: 1h
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_IS_FORMAT_JSON: ${LOG_IS_FORMAT_JSON:-false}
+      LOG_IS_FULL_DETAILS: ${LOG_IS_FULL_DETAILS:-false}
+      EMAIL_ENABLE: ${EMAIL_ENABLE:-false}
+      EMAIL_FROM: ${EMAIL_FROM:-noreply@xogent.com}
+      EMAIL_HOST: ${EMAIL_HOST:-}
+      EMAIL_PORT: ${EMAIL_PORT:-587}
+      EMAIL_USERNAME: ${EMAIL_USERNAME:-}
+    volumes:
+      - files_data:/data/files
+      - secrets_server:/run/secrets:ro
+      # Writable: the filesystem secret provider stores per-tenant secrets here.
+      - tenant_secrets:/run/secrets/tenants
+      # First-login helper; see docs/deployment/coolify.md.
+      - type: bind
+        source: ./scripts/coolify/set-admin-password.sh
+        target: /app/coolify/set-admin-password.sh
+        read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_started
+
+  # Temporal backs the v2 workflow runtime; it stores its data in the bundled
+  # postgres (databases `temporal` and `temporal_visibility`, created on first start).
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    restart: unless-stopped
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_SEEDS: postgres
+      POSTGRES_USER: postgres
+    entrypoint: ["/bin/sh"]
+    command:
+      - -c
+      - |
+        export POSTGRES_PWD="$$(cat /run/secrets/postgres_password)"
+        exec /etc/temporal/entrypoint.sh autosetup
+    volumes:
+      - secrets_temporal:/run/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  workflow-worker:
+    # The published CE image does not ship the worker bundle, so it is built from this checkout.
+    build:
+      context: .
+      dockerfile: services/workflow-worker/Dockerfile
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      EDITION: community
+      APP_NAME: ${APP_NAME:-alga-psa}
+      VERSION: ${VERSION:-1.0.0}
+      APP_ENV: production
+      NODE_ENV: production
+      HOST: ${ALGA_PUBLIC_URL:-https://psa.xogent.com}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DB_TYPE: postgres
+      DB_HOST: pgbouncer
+      DB_PORT: "6432"
+      DB_NAME: server
+      DB_NAME_SERVER: server
+      DB_USER_SERVER: app_user
+      DB_USER_ADMIN: postgres
+      PGBOSS_DATABASE: server
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_IS_FORMAT_JSON: ${LOG_IS_FORMAT_JSON:-false}
+      LOG_IS_FULL_DETAILS: ${LOG_IS_FULL_DETAILS:-false}
+      SECRET_READ_CHAIN: env,filesystem
+      SECRET_WRITE_PROVIDER: filesystem
+      WORKFLOW_WORKER_MODE: ${WORKFLOW_WORKER_MODE:-v2}
+      WORKFLOW_DISTRIBUTED_MODE: "true"
+      WORKFLOW_REDIS_STREAM_PREFIX: "workflow:events:"
+      WORKFLOW_REDIS_CONSUMER_GROUP: "workflow-workers"
+      WORKFLOW_REDIS_BATCH_SIZE: "10"
+      WORKFLOW_REDIS_IDLE_TIMEOUT_MS: "60000"
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+    volumes:
+      - secrets_worker:/run/secrets:ro
+      # Workflow steps resolve per-tenant secrets written by the server.
+      - tenant_secrets:/run/secrets/tenants:ro
+    depends_on:
+      server:
+        condition: service_started
+      temporal:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  files_data:
+  tenant_secrets:
+  secrets_postgres:
+  secrets_temporal:
+  secrets_pgbouncer:
+  secrets_redis:
+  secrets_setup:
+  secrets_server:
+  secrets_worker:
