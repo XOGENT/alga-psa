@@ -2,7 +2,12 @@
 
 `docker-compose.coolify.yaml` runs the Community Edition stack with Coolify's Docker Compose
 build pack: Postgres (pgvector), PgBouncer, Redis, the one-shot `setup` job (roles, migrations,
-seeds), the Next.js `server`, Temporal, and the workflow worker.
+seeds) and the Next.js `server`.
+
+The workflow worker (and the Temporal server its v2 runtime needs) is **not included yet**:
+building it from source during a Coolify deploy starved a shared production host. It will be
+added back as an image prebuilt in CI, so the server only pulls it. Until then, workflow
+automations do not run; the rest of the app works.
 
 ## How secrets work
 
@@ -37,7 +42,7 @@ up together with the database.
 4. **Domains:** set the `server` service to `https://<your-domain>:3000`
    (`:3000` is the container port Traefik routes to; the public URL has no port).
 5. **Environment Variables:** set `ALGA_PUBLIC_URL=https://<your-domain>`.
-6. **Deploy.** The first deploy builds Redis, PgBouncer and the workflow worker from source and
+6. **Deploy.** The first deploy builds Redis and PgBouncer from source and
    pulls the server image (adding the repository's setup scripts on top via
    `docker/coolify/app.Dockerfile`); `setup` then creates the databases and runs migrations before
    `server` starts. Watch `setup` logs if `server` never starts.
@@ -60,7 +65,7 @@ The other seeded demo users have intentionally invalid password hashes and canno
 
 `ALGA_IMAGE_TAG` (the 8-character commit SHA of a `main` commit with a published
 `ghcr.io/nine-minds/alga-psa-ce` image) must match the commit the branch is deployed from,
-because Redis, PgBouncer, setup scripts and the workflow worker come from the checkout. To
+because Redis, PgBouncer and the setup scripts come from the checkout. To
 upgrade: rebase the deploy branch onto the new commit, set `ALGA_IMAGE_TAG` to its short SHA
 (default in the compose file or a Coolify env var), and redeploy. `setup` runs new migrations.
 
@@ -68,8 +73,9 @@ upgrade: rebase the deploy branch onto the new commit, set `ALGA_IMAGE_TAG` to i
 
 - Redis has no data volume, so in-flight workflow event streams are lost when it is recreated.
 - `redis/Dockerfile` and `pgbouncer/Dockerfile` build from floating `latest` base images.
-- On the very first boot the workflow worker may restart once if Temporal is still registering
-  its `default` namespace; `restart: unless-stopped` recovers it.
+- Coolify passes every environment variable as a Docker build argument by default; untick
+  **Available at Buildtime** for the `SERVICE_PASSWORD_64_*` variables so generated secrets are
+  not recorded in local image history (the Redis image has `RUN` steps).
 
 ## Backups
 
