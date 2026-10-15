@@ -10,13 +10,14 @@
 #     first and would silently override the file.
 #   - Migrations, seeds and scripts come from the server image itself (baked by
 #     the root Dockerfile) instead of bind mounts, so schema and code always match.
-#   - Pin ALGA_IMAGE_TAG to the commit this file is deployed from; Redis,
-#     PgBouncer and the workflow worker are built from that same checkout
-#     (their Dockerfiles still use floating redis/pgbouncer base images).
+#   - Repository files (postgres/setup entrypoints, setup config, the admin
+#     password helper) are baked in by docker/coolify/*.Dockerfile instead of
+#     bind-mounted: Coolify registers repo-file bind mounts as directories.
+#   - Pin ALGA_IMAGE_TAG to the commit this file is deployed from; setup/server
+#     layers, Redis, PgBouncer and the workflow worker are built from that same
+#     checkout (redis/pgbouncer Dockerfiles still use floating base images).
 #
-# Coolify settings this file relies on (see docs/deployment/coolify.md):
-#   - Configuration > General > "Preserve Repository During Deployment" ON
-#     (setup and postgres bind-mount scripts from the repository).
+# Coolify setting this file relies on (see docs/deployment/coolify.md):
 #   - Domain for the `server` service, e.g. https://psa.xogent.com:3000
 
 services:
@@ -105,7 +106,9 @@ services:
         echo "secrets-init: secrets written"
 
   postgres:
-    image: ${ALGA_PGVECTOR_IMAGE:-pgvector/pgvector:0.8.7-pg15-bookworm@sha256:47af0b65960b14f1c6945aa4ccae37836c632e9a6fe0eea9160936e616e5b2e9}
+    build:
+      context: .
+      dockerfile: docker/coolify/postgres.Dockerfile
     restart: unless-stopped
     # Wrapper refuses/repairs legacy `trust` entries in pg_hba.conf, then execs the stock entrypoint.
     entrypoint: ["/bin/bash", "/usr/local/bin/alga-postgres-entrypoint.sh"]
@@ -119,10 +122,6 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - secrets_postgres:/run/secrets:ro
-      - type: bind
-        source: ./postgres/alga-postgres-entrypoint.sh
-        target: /usr/local/bin/alga-postgres-entrypoint.sh
-        read_only: true
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d server"]
       interval: 10s
@@ -135,7 +134,9 @@ services:
 
   # One-shot: brings extensions of an existing data directory in line with the pinned image.
   postgres-extension-update:
-    image: ${ALGA_PGVECTOR_IMAGE:-pgvector/pgvector:0.8.7-pg15-bookworm@sha256:47af0b65960b14f1c6945aa4ccae37836c632e9a6fe0eea9160936e616e5b2e9}
+    build:
+      context: .
+      dockerfile: docker/coolify/postgres.Dockerfile
     restart: "no"
     exclude_from_hc: true
     entrypoint: ["/bin/sh", "/opt/alga/update-extensions.sh"]
@@ -145,10 +146,6 @@ services:
       PGPASSWORD_FILE: /run/secrets/postgres_password
     volumes:
       - secrets_postgres:/run/secrets:ro
-      - type: bind
-        source: ./helm/files/postgres/update-extensions.sh
-        target: /opt/alga/update-extensions.sh
-        read_only: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -181,7 +178,11 @@ services:
 
   # One-shot: creates roles/databases, runs migrations and seeds from the server image.
   setup:
-    image: "ghcr.io/nine-minds/alga-psa-ce:${ALGA_IMAGE_TAG:-43b1f2ec}"
+    build:
+      context: .
+      dockerfile: docker/coolify/app.Dockerfile
+      args:
+        ALGA_IMAGE_TAG: ${ALGA_IMAGE_TAG:-43b1f2ec}
     platform: linux/amd64
     restart: "no"
     exclude_from_hc: true
@@ -210,14 +211,6 @@ services:
       NEXTAUTH_SESSION_EXPIRES: ${NEXTAUTH_SESSION_EXPIRES:-86400}
     volumes:
       - secrets_setup:/run/secrets:ro
-      - type: bind
-        source: ./setup/config.ini
-        target: /app/setup/config.ini
-        read_only: true
-      - type: bind
-        source: ./setup/entrypoint.sh
-        target: /app/setup/entrypoint.sh
-        read_only: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -225,7 +218,11 @@ services:
         condition: service_completed_successfully
 
   server:
-    image: "ghcr.io/nine-minds/alga-psa-ce:${ALGA_IMAGE_TAG:-43b1f2ec}"
+    build:
+      context: .
+      dockerfile: docker/coolify/app.Dockerfile
+      args:
+        ALGA_IMAGE_TAG: ${ALGA_IMAGE_TAG:-43b1f2ec}
     platform: linux/amd64
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c", "export DATABASE_URL=postgresql://app_user:$$(cat /run/secrets/db_password_server)@pgbouncer:6432/server && exec /app/entrypoint.sh"]
@@ -282,11 +279,6 @@ services:
       - secrets_server:/run/secrets:ro
       # Writable: the filesystem secret provider stores per-tenant secrets here.
       - tenant_secrets:/run/secrets/tenants
-      # First-login helper; see docs/deployment/coolify.md.
-      - type: bind
-        source: ./scripts/coolify/set-admin-password.sh
-        target: /app/coolify/set-admin-password.sh
-        read_only: true
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/healthz >/dev/null || exit 1"]
       interval: 30s

@@ -29,20 +29,17 @@ up together with the database.
 
 1. DNS: point an `A` record for the app's domain at the server's IP.
 2. In Coolify: **Projects → + Add** (e.g. `alga-psa`), open the `production` environment,
-   **+ New → Private Repository (with GitHub App)**, choose the repository and branch that
-   contain `docker-compose.coolify.yaml`, and select the target server.
+   **+ New → Public Repository** with the repository's HTTPS URL (a GitHub App source also
+   works for private forks), choose the branch that contains `docker-compose.coolify.yaml`,
+   and select the target server. Avoid `/` in the branch name.
 3. **Build Pack:** Docker Compose. **Base Directory:** `/`.
    **Docker Compose Location:** `/docker-compose.coolify.yaml`. Click **Load Compose File**.
-4. **Configuration → General:** enable **Preserve Repository During Deployment**
-   (`setup`, `postgres`, `postgres-extension-update` and `server` bind-mount scripts from the
-   repository). After **Load Compose File**, check the **Storages** tab lists those mounts as
-   files; if Docker sees a missing source it creates a directory and the container fails with
-   `not a directory`.
-5. **Domains:** set the `server` service to `https://<your-domain>:3000`
+4. **Domains:** set the `server` service to `https://<your-domain>:3000`
    (`:3000` is the container port Traefik routes to; the public URL has no port).
-6. **Environment Variables:** set `ALGA_PUBLIC_URL=https://<your-domain>`.
-7. **Deploy.** The first deploy builds Redis, PgBouncer and the workflow worker from source and
-   pulls the server image; `setup` then creates the databases and runs migrations before
+5. **Environment Variables:** set `ALGA_PUBLIC_URL=https://<your-domain>`.
+6. **Deploy.** The first deploy builds Redis, PgBouncer and the workflow worker from source and
+   pulls the server image (adding the repository's setup scripts on top via
+   `docker/coolify/app.Dockerfile`); `setup` then creates the databases and runs migrations before
    `server` starts. Watch `setup` logs if `server` never starts.
 
 ## First login
